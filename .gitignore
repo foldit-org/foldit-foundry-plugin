@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Foldit plugin: model weights are fetched at runtime, never committed
+assets/weights/
+
+# Foldit plugin: prebuilt/native artifacts fetched or built locally
+.pixi/

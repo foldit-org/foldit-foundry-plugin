@@ -1,0 +1,25 @@
+[project]
+# Distribution name renamed to avoid collision with the `foundry`
+# package shipped by rc-foundry (deps/foundry). This plugin's Python
+# module is `foundry_plugin`; rc-foundry's package stays `foundry` so
+# `from foundry.metrics... import ...` (used by mpnn/rf3/rfd3) resolves
+# there. Mirrors simplefold-plugin.
+name = "foundry-plugin"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "foldit-plugin-sdk>=0.1.4",
+    "numpy",
+    "biotite",
+    "transformers",
+    "optimum-quanto",
+    # rc-foundry provides rf3 / rfd3 / mpnn sub-engines (path-editable
+    # install of the bundled submodule at ./deps/foundry).
+    "rc-foundry",
+    # molex provides COORDS-format Assembly conversions.
+    "molex==0.7.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,19 @@
+# Plugin id is "foundry" (user-facing orchestrator key). The Python
+# entry module is "foundry_plugin" to avoid colliding with the `foundry`
+# package provided by rc-foundry (deps/foundry), which exposes
+# `foundry.metrics` / model code that mpnn/rf3/rfd3 import from. Likewise
+# the pyproject distribution name is "foundry-plugin". Mirrors simplefold.
+id = "foundry"
+kind = "python"
+
+[python]
+entry = "foundry_plugin"
+
+# User-facing buttons. Op-ids match the plugin's `register()` operations.
+# Icons are relative to this directory; the orchestrator resolves them to
+# absolute paths when building the catalog.
+[[buttons]]
+op = "rfd3_design"
+display = "RFdiffusion3"
+icon = "assets/icons/rf_diffusion.png"
+tooltip = "RFdiffusion3 binder design: generate a binder against the focused protein or ligand (50 diffusion steps)"
