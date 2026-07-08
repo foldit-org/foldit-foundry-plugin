@@ -1,0 +1,6 @@
+# Build descriptor for `cargo xtask setup-plugins`. Read only by xtask; the
+# runtime never parses this file (runtime config lives in plugin.toml).
+
+# Marker: xtask runs `pixi install --all` in this plugin dir. molex composes
+# into the env via the plugin's own pixi.toml.
+[python]
