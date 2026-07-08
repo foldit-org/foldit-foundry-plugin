@@ -4,24 +4,31 @@ version = "0.1.0"
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64", "win-64"]
 
-[dependencies]
+# The dev environment is named `foundry` (matching the plugin id) so the
+# orchestrator's env resolver finds it at `.pixi/envs/foundry`
+# (manifest.python_env() defaults to the plugin id, and it walks up from this
+# plugin dir to this pixi.toml). `pixi install` solves it here.
+[feature.foundry.dependencies]
 python = "3.12.*"
 pytest = "*"
 
-# Force Python into UTF-8 mode. pixi activates the environment before
-# building PyPI source dists, so this reaches the setuptools build
-# subprocess. Without it, Windows' default cp1252 codec makes `open()`
-# in a dependency's setup.py choke on UTF-8 bytes. No-op on macOS/Linux.
-[activation.env]
+# Force Python into UTF-8 mode. pixi activates the environment before building
+# PyPI source dists, so this reaches the setuptools build subprocess. Without
+# it, Windows' default cp1252 codec makes `open()` in a dependency's setup.py
+# choke on UTF-8 bytes. No-op on macOS/Linux, which already default to UTF-8.
+[feature.foundry.activation.env]
 PYTHONUTF8 = "1"
 
-[pypi-dependencies]
-# This plugin. Its Python module is `foundry_plugin`; the distribution
-# name is `foundry-plugin` so it does not shadow the `foundry` package
-# that rc-foundry (deps/foundry) provides.
+[feature.foundry.pypi-dependencies]
+# This plugin. Its Python module is `foundry_plugin`; the distribution name is
+# `foundry-plugin` so it does not shadow the `foundry` package rc-foundry
+# (deps/foundry) provides.
 foundry-plugin = { path = ".", editable = true }
 # rc-foundry provides the rf3 / rfd3 / mpnn sub-engines.
 rc-foundry = { path = "deps/foundry", editable = true }
 # Published contract SDK + structure conversions.
 foldit-plugin-sdk = ">=0.1.4"
 molex = "==0.7.2"
+
+[environments]
+foundry = { features = ["foundry"] }
