@@ -27,8 +27,8 @@ foundry-plugin = { path = ".", editable = true }
 # rc-foundry provides the rf3 / rfd3 / mpnn sub-engines.
 rc-foundry = { path = "deps/foundry", editable = true }
 # Published contract SDK + structure conversions.
-foldit-plugin-sdk = ">=0.1.4"
-molex = "==0.7.2"
+foldit-plugin-sdk = ">=0.1.6"
+molex = "==0.7.4"
 
 [environments]
 foundry = { features = ["foundry"] }
