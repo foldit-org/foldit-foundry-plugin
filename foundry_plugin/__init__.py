@@ -1,6 +1,6 @@
 """Foundry unified plugin.
 
-Consolidates RoseTTAFold3 (predict), RFdiffusion3 (design), and
+Consolidates RoseTTAFold3 (rf3_predict), RFdiffusion3 (rfd3_design), and
 LigandMPNN (sequence_design) into a single plugin that runs in the
 shared foundry pixi environment. Sub-engines load lazily on first use
 to conserve GPU memory; checkpoint discovery happens eagerly at init
@@ -10,11 +10,13 @@ Catalog:
 
 Ops (mutate state, return assembly bytes):
 
-- ``predict(num_recycles)`` — STREAM. RF3. Reads the focused or
+- ``rf3_predict(num_recycles)`` — STREAM. RF3. Reads the focused or
   session-wide assembly via ``init`` / ``update_assembly``.
   ``creates_entities=True``.
-- ``design(length, contig, num_designs, num_steps, step_scale,
+- ``rfd3_design(length, contig, num_designs, num_steps, step_scale,
   save_trajectories)`` — STREAM. RFD3. Same assembly source.
+- ``mpnn_design(num_sequences, temperature)`` — INVOKE. LigandMPNN.
+  Samples sequences for the focused chain and commits the best.
   ``creates_entities=True``.
 
 Queries (read state, return query-defined data):
@@ -350,6 +352,7 @@ def _build_template_residue(target_residue, new_three_letter, residue_template_f
 def _entity_info_from_assembly(assembly_bytes, atom_array):
     """Walk the assembly's entities → list of {molecule_type, chain_id, atom_count}.
 
+    `entity_id` is the molex-allocated EntityId the host addresses entities by;
     `molecule_type` is lower-cased ("protein", "ligand", "cofactor", ...) to
     match the comparisons the callers make; `chain_id` is the entity's chain
     id ("" for a non-polymer entity with no chain). `atom_count` lets callers
@@ -362,6 +365,7 @@ def _entity_info_from_assembly(assembly_bytes, atom_array):
         entities = []
         for e in asm.entities():
             entities.append({
+                "entity_id": e.id,
                 "molecule_type": e.molecule_type.lower(),
                 "chain_id": e.chain_id or "",
                 "atom_count": e.atom_count,
@@ -427,14 +431,67 @@ def _build_context_contig(atom_array, assembly_bytes, design_length_range):
     return ",".join(parts)
 
 
+def _splice_coords(target, source):
+    """Write `source` coordinates and B-factors onto `target` by atom identity.
+
+    RF3's pipeline returns a DIFFERENT atom set than it was handed (hydrogens
+    stripped, terminal oxygens removed, ligands atomized, short polymers
+    dropped), so its output cannot be committed over the session's entity lanes
+    directly. Matching on ``(chain_id, res_id, atom_name)`` writes the predicted
+    coordinates back onto the original array, preserving atom count, ordering,
+    and the ``entity_id`` annotation the host matches entities by. Atoms RF3
+    dropped keep their prior coordinates.
+
+    Returns ``(spliced_atom_array, matched_atom_count)``.
+    """
+    out = target.copy()
+    index = {}
+    for j in range(len(source)):
+        key = (
+            str(source.chain_id[j]),
+            int(source.res_id[j]),
+            str(source.atom_name[j]),
+        )
+        index[key] = j
+
+    source_b = getattr(source, "b_factor", None)
+    out_b = getattr(out, "b_factor", None)
+    matched = 0
+    for i in range(len(out)):
+        key = (str(out.chain_id[i]), int(out.res_id[i]), str(out.atom_name[i]))
+        j = index.get(key)
+        if j is None:
+            continue
+        out.coord[i] = source.coord[j]
+        if source_b is not None and out_b is not None:
+            out_b[i] = source_b[j]
+        matched += 1
+    return out, matched
+
+
+def _entity_index_for_id(entity_info, entity_id):
+    """Position of `entity_id` within the assembly's entity list, or None.
+
+    The host addresses entities by their molex-allocated `EntityId`, which
+    coincides with the list position only on a freshly loaded assembly and
+    diverges after any entity is added or removed. Every caller that needs to
+    slice `atom_array` per entity must go through this.
+    """
+    if entity_id is None:
+        return None
+    for idx, info in enumerate(entity_info):
+        if info.get("entity_id") == entity_id:
+            return idx
+    return None
+
+
 def _build_focused_target_contig(
     atom_array, assembly_bytes, focused_entity_id, design_length_range
 ):
     """Build a binder-design spec that targets one focused entity.
 
-    `focused_entity_id` follows the plugin-wide convention (mirrors
-    `_sequence_design_impl` / `_run_apply_sequence`): a 0-indexed position
-    in the assembly's entity list.
+    `focused_entity_id` is the host's molex `EntityId`; it is resolved to a
+    position in the assembly's entity list via `_entity_index_for_id`.
 
     Returns ``(contig, ligand)`` or ``None``:
 
@@ -448,18 +505,19 @@ def _build_focused_target_contig(
       → ``None``; the caller falls back to whole-assembly context.
     """
     entity_info = _entity_info_from_assembly(assembly_bytes, atom_array)
-    if not entity_info or not (0 <= focused_entity_id < len(entity_info)):
+    focused_idx = _entity_index_for_id(entity_info, focused_entity_id)
+    if focused_idx is None:
         return None
 
     atom_start = sum(
-        info.get("atom_count", 0) for info in entity_info[:focused_entity_id]
+        info.get("atom_count", 0) for info in entity_info[:focused_idx]
     )
-    atom_end = atom_start + entity_info[focused_entity_id].get("atom_count", 0)
+    atom_end = atom_start + entity_info[focused_idx].get("atom_count", 0)
     atom_end = min(atom_end, len(atom_array))
     if atom_start >= atom_end:
         return None
 
-    focused = entity_info[focused_entity_id]
+    focused = entity_info[focused_idx]
     mol_type = focused.get("molecule_type", "")
     chain_id = focused.get("chain_id", "")
 
@@ -618,6 +676,7 @@ class Plugin(PluginInterface):
             operations=[
                 self._predict_op_spec(),
                 self._design_op_spec(),
+                self._mpnn_design_op_spec(),
                 self._apply_sequence_op_spec(),
                 weights.download_weights_op_spec(),
             ],
@@ -630,11 +689,20 @@ class Plugin(PluginInterface):
     @staticmethod
     def _predict_op_spec() -> plugin_pb2.PluginOp:
         return plugin_pb2.PluginOp(
-            id="predict",
+            id="rf3_predict",
             display_name="Predict (RF3)",
             description="Structure prediction with RoseTTAFold3.",
             kind=plugin_pb2.OP_KIND_STREAM,
-            creates_entities=True,
+            # Never creates entities: the prediction is committed as new
+            # coordinates on the existing lanes. `compatible_focus_types` with
+            # no `requires_focus` makes focus OPTIONAL -- the host locks just
+            # the focused entity (so only it commits) and falls back to a
+            # global lock (whole-structure refold) when nothing is focused.
+            creates_entities=False,
+            compatible_focus_types=[
+                plugin_pb2.ENTITY_TYPE_PROTEIN,
+                plugin_pb2.ENTITY_TYPE_NUCLEIC_ACID,
+            ],
             params=[
                 plugin_pb2.ParamSpec(
                     name="num_recycles",
@@ -654,8 +722,8 @@ class Plugin(PluginInterface):
             # Op-ids must be globally unique: dispatch routes op-id → plugin
             # through a flat registry (last-writer-wins). A bare "design"
             # collides with the dummy plugin's "design", so this is namespaced
-            # to the model. predict/sequence_design still collide across
-            # plugins (simplefold/dummy) but aren't wired to buttons.
+            # to the model, as `rf3_predict` is. The `sequence_design` QUERY id
+            # still collides with dummy's, but queries carry no buttons.
             id="rfd3_design",
             display_name="Design (RFD3)",
             description="De novo / motif-scaffold protein design.",
@@ -731,6 +799,50 @@ class Plugin(PluginInterface):
         )
 
     @staticmethod
+    def _mpnn_design_op_spec() -> plugin_pb2.PluginOp:
+        """One-shot LigandMPNN redesign of the focused chain.
+
+        The `sequence_design` QUERY returns N scored candidates for a panel to
+        offer; this op is the button-shaped counterpart -- it runs the same
+        compute and commits the best-scoring sequence via `apply_sequence`.
+        """
+        return plugin_pb2.PluginOp(
+            id="mpnn_design",
+            display_name="Design (LigandMPNN)",
+            description=(
+                "Redesign the focused protein chain's sequence with "
+                "LigandMPNN and apply the best-scoring candidate. Selected "
+                "residues are held fixed."
+            ),
+            kind=plugin_pb2.OP_KIND_INVOKE,
+            creates_entities=False,
+            compatible_focus_types=[plugin_pb2.ENTITY_TYPE_PROTEIN],
+            requires_focus=True,
+            params=[
+                plugin_pb2.ParamSpec(
+                    name="num_sequences",
+                    display_name="Candidates",
+                    description="How many sequences to sample; the best is applied.",
+                    type=plugin_pb2.PARAM_TYPE_INT,
+                    default=make_param_value(8),
+                    constraints=plugin_pb2.ParamConstraints(
+                        int_range=plugin_pb2.IntRange(min=1, max=32),
+                    ),
+                ),
+                plugin_pb2.ParamSpec(
+                    name="temperature",
+                    display_name="Temperature",
+                    description="Sampling temperature; lower is more conservative.",
+                    type=plugin_pb2.PARAM_TYPE_FLOAT,
+                    default=make_param_value(0.1),
+                    constraints=plugin_pb2.ParamConstraints(
+                        float_range=plugin_pb2.FloatRange(min=0.01, max=1.0),
+                    ),
+                ),
+            ],
+        )
+
+    @staticmethod
     def _sequence_design_query_spec() -> plugin_pb2.PluginQuery:
         return plugin_pb2.PluginQuery(
             id="sequence_design",
@@ -776,6 +888,8 @@ class Plugin(PluginInterface):
             ),
             kind=plugin_pb2.OP_KIND_INVOKE,
             creates_entities=False,
+            compatible_focus_types=[plugin_pb2.ENTITY_TYPE_PROTEIN],
+            requires_focus=True,
             params=[
                 plugin_pb2.ParamSpec(
                     name="sequence",
@@ -809,7 +923,7 @@ class Plugin(PluginInterface):
             self._start_download(request_id)
             return
 
-        if op == "predict":
+        if op == "rf3_predict":
             if not self._rf3_checkpoint:
                 self._rediscover_checkpoints()
             if not self._rf3_checkpoint:
@@ -821,7 +935,7 @@ class Plugin(PluginInterface):
             self._cancel[rid] = False
             threading.Thread(
                 target=self._run_predict,
-                args=(rid, params),
+                args=(rid, context, params),
                 name=f"foundry-predict-{rid}",
                 daemon=True,
             ).start()
@@ -883,6 +997,8 @@ class Plugin(PluginInterface):
     ) -> bytes:
         if op == "apply_sequence":
             return self._run_apply_sequence(context, params)
+        if op == "mpnn_design":
+            return self._run_mpnn_design(context, params)
         raise ValueError(f"Unknown invoke op: {op!r}")
 
     # Weight download (download_weights op)
@@ -991,9 +1107,21 @@ class Plugin(PluginInterface):
 
     # predict (RF3)
 
-    def _run_predict(self, rid: int, params: dict[str, Any]) -> None:
+    def _run_predict(
+        self, rid: int, context: DispatchContext, params: dict[str, Any]
+    ) -> None:
         try:
             num_recycles = int(params.get("num_recycles", 4))
+            # RF3 has no native subset prediction, so the whole assembly is
+            # always folded (it needs the full context anyway). Scoping to the
+            # focused entity is the host's job: an entity-scoped lock means
+            # only that entity's lane accepts the committed coordinates.
+            if context.focused_entity_id is not None:
+                logger.info(
+                    "Foundry rf3_predict rid=%d: focused entity %s; only its "
+                    "lane will accept the result",
+                    rid, context.focused_entity_id,
+                )
             if not self._assembly:
                 raise RuntimeError("No assembly — call init or update_assembly first")
 
@@ -1094,7 +1222,20 @@ class Plugin(PluginInterface):
                 rf3_output.summary_confidences.get("ranking_score", 0.0) / 100.0,
             )
 
-        result_bytes = molex_io.atom_array_to_assembly_bytes(out_atom_array)
+        # RF3 returns a processed atom set, not the one it was given; splice
+        # its coordinates back onto the input so the commit preserves atom
+        # count, order and entity ids.
+        spliced, matched = _splice_coords(atom_array, out_atom_array)
+        if matched == 0:
+            raise RuntimeError(
+                "RF3 returned no atoms matching the input structure; refusing "
+                "to commit a prediction that cannot be aligned"
+            )
+        logger.info(
+            "RF3 spliced %d/%d predicted atoms onto the input structure",
+            matched, len(atom_array),
+        )
+        result_bytes = molex_io.atom_array_to_assembly_bytes(spliced)
         return None, result_bytes, confidence
 
     def _build_rf3_step_callback(self, rid: int, atom_array):
@@ -1591,9 +1732,7 @@ class Plugin(PluginInterface):
         assert self._assembly is not None
         atom_array = molex_io.assembly_bytes_to_atom_array_plus(self._assembly)
 
-        # Derive chain roles from focused entity. focused_entity_id is
-        # interpreted as a 0-indexed entity in the assembly's entity
-        # list; orchestrator and plugin agree on this convention.
+        # Derive chain roles from the focused entity.
         designed_chains: list[str] | None = None
         fixed_chains: list[str] | None = None
 
@@ -1609,61 +1748,80 @@ class Plugin(PluginInterface):
             if info.get("molecule_type") != "protein" and info.get("chain_id")
         ]
 
-        if context.focused_entity_id is not None and entity_info:
-            idx = context.focused_entity_id
-            if 0 <= idx < len(entity_info):
-                focused = entity_info[idx]
-                if focused.get("molecule_type") == "protein":
-                    designed_chains = [focused["chain_id"]]
-                    fixed_chains = [
-                        c for c in protein_chains if c != focused["chain_id"]
-                    ] + non_protein_chains
+        focused_idx = _entity_index_for_id(entity_info, context.focused_entity_id)
+        if focused_idx is not None:
+            focused = entity_info[focused_idx]
+            if focused.get("molecule_type") == "protein":
+                designed_chains = [focused["chain_id"]]
+                fixed_chains = [
+                    c for c in protein_chains if c != focused["chain_id"]
+                ] + non_protein_chains
 
         if designed_chains is None:
             # Fallback: design all protein chains, fix non-proteins.
             designed_chains = protein_chains or None
             fixed_chains = non_protein_chains or None
 
-        # Selection → fixed_residues. Map each ResidueRef to MPNN's
-        # "{chain_id}{res_id}" spec. We resolve chain via entity_id index
-        # using the same convention as focused_entity_id above.
-        fixed_residues_list: list[str] | None = None
-        if context.selection:
-            # Build entity_id → chain_id map.
-            entity_chain_lookup = {
-                idx: info["chain_id"]
-                for idx, info in enumerate(entity_info)
-                if info.get("chain_id")
-            }
-            # Build per-entity residue-index → res_id arrays. Each entity's
-            # contiguous atoms in atom_array map back to res_ids via an
-            # indexing pass.
-            entity_res_ids: dict[int, list[int]] = {}
-            atom_offset = 0
-            for idx, info in enumerate(entity_info):
-                ac = info.get("atom_count", 0)
-                end = min(atom_offset + ac, len(atom_array))
-                if atom_offset < end:
-                    seen: list[int] = []
-                    last = None
-                    for i in range(atom_offset, end):
-                        rid_v = int(atom_array.res_id[i])
-                        if rid_v != last:
-                            seen.append(rid_v)
-                            last = rid_v
-                    entity_res_ids[idx] = seen
-                atom_offset += ac
+        # Build EntityId-keyed lookups: chain id, and residue-index → res_id.
+        # Each entity's atoms are contiguous in atom_array, so one pass over
+        # the concatenated array recovers per-entity residue ordering.
+        entity_chain_lookup: dict[int, str] = {}
+        entity_res_ids: dict[int, list[int]] = {}
+        atom_offset = 0
+        for info in entity_info:
+            eid = info.get("entity_id")
+            if info.get("chain_id") and eid is not None:
+                entity_chain_lookup[eid] = info["chain_id"]
+            ac = info.get("atom_count", 0)
+            end = min(atom_offset + ac, len(atom_array))
+            if eid is not None and atom_offset < end:
+                seen: list[int] = []
+                last = None
+                for i in range(atom_offset, end):
+                    rid_v = int(atom_array.res_id[i])
+                    if rid_v != last:
+                        seen.append(rid_v)
+                        last = rid_v
+                entity_res_ids[eid] = seen
+            atom_offset += ac
 
-            specs: list[str] = []
-            for ref in context.selection:
-                eid = ref.entity_id
-                ridx = ref.residue_index
-                chain = entity_chain_lookup.get(eid)
-                resids = entity_res_ids.get(eid, [])
-                if chain and 0 <= ridx < len(resids):
-                    specs.append(f"{chain}{resids[ridx]}")
-            if specs:
-                fixed_residues_list = specs
+        def _spec(entity_id: int, residue_index: int) -> str | None:
+            """MPNN's "{chain_id}{res_id}" spec for one residue, or None."""
+            chain = entity_chain_lookup.get(entity_id)
+            resids = entity_res_ids.get(entity_id, [])
+            if chain and 0 <= residue_index < len(resids):
+                return f"{chain}{resids[residue_index]}"
+            return None
+
+        # Two independent sources of fixed residues:
+        #   * the user's selection — "hold these where they are";
+        #   * the puzzle's design mask — every residue NOT designable is fixed.
+        # An empty `designable` means the session gates no design at all, so it
+        # contributes nothing rather than fixing everything.
+        specs: list[str] = []
+        for ref in context.selection:
+            spec = _spec(ref.entity_id, ref.residue_index)
+            if spec:
+                specs.append(spec)
+
+        if context.designable:
+            designable_by_entity: dict[int, set[int]] = {}
+            for ref in context.designable:
+                designable_by_entity.setdefault(ref.entity_id, set()).add(
+                    ref.residue_index
+                )
+            for entity_id, resids in entity_res_ids.items():
+                allowed = designable_by_entity.get(entity_id, set())
+                for ridx in range(len(resids)):
+                    if ridx in allowed:
+                        continue
+                    spec = _spec(entity_id, ridx)
+                    if spec:
+                        specs.append(spec)
+
+        # De-duplicate while preserving order (a residue can be both selected
+        # and non-designable).
+        fixed_residues_list = list(dict.fromkeys(specs)) or None
 
         input_dict = {
             "structure_path": None,
@@ -1720,6 +1878,34 @@ class Plugin(PluginInterface):
 
     # apply_sequence (INVOKE)
 
+    def _run_mpnn_design(
+        self, context: DispatchContext, params: dict[str, Any]
+    ) -> bytes:
+        """Sample sequences with LigandMPNN and commit the best-scoring one."""
+        num_sequences = max(1, min(int(params.get("num_sequences", 8)), 32))
+        temperature = float(params.get("temperature", 0.1))
+
+        raw = self._sequence_design_impl(num_sequences, temperature, context)
+        best_seq, best_score = "", float("-inf")
+        for line in raw.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            seq, _, score_text = line.partition("\t")
+            try:
+                score = float(score_text)
+            except ValueError:
+                continue
+            if seq and score > best_score:
+                best_seq, best_score = seq, score
+        if not best_seq:
+            raise RuntimeError("LigandMPNN returned no usable sequence")
+
+        logger.info(
+            "mpnn_design: applying best of %d candidates (recovery=%.4f)",
+            num_sequences, best_score,
+        )
+        return self._run_apply_sequence(context, {"sequence": best_seq})
+
     def _run_apply_sequence(
         self, context: DispatchContext, params: dict[str, Any]
     ) -> bytes:
@@ -1760,13 +1946,9 @@ class Plugin(PluginInterface):
         # Resolve designed entity via focused_entity_id (mirrors
         # _sequence_design_impl); fall back to the first protein entity.
         designed_idx: int | None = None
-        if context.focused_entity_id is not None and entity_info:
-            idx = context.focused_entity_id
-            if (
-                0 <= idx < len(entity_info)
-                and entity_info[idx].get("molecule_type") == "protein"
-            ):
-                designed_idx = idx
+        idx = _entity_index_for_id(entity_info, context.focused_entity_id)
+        if idx is not None and entity_info[idx].get("molecule_type") == "protein":
+            designed_idx = idx
         if designed_idx is None:
             for i, info in enumerate(entity_info):
                 if info.get("molecule_type") == "protein":

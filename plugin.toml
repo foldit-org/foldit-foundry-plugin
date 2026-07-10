@@ -17,3 +17,28 @@ op = "rfd3_design"
 display = "RFdiffusion3"
 icon = "assets/icons/rf_diffusion.png"
 tooltip = "RFdiffusion3 binder design: generate a binder against the focused protein or ligand (50 diffusion steps)"
+
+# RoseTTAFold3 structure prediction. Focus is optional: with an entity focused
+# the host locks just that lane, so only its coordinates are committed; with no
+# focus the op takes the global lock and refolds the whole structure. RF3 always
+# sees the full assembly as context either way.
+#
+# `preview = true`: the diffusion intermediates are backbone-only, so they
+# animate a discardable ghost rather than overwriting the real lane, which would
+# strip sidechains mid-stream.
+[[buttons]]
+op = "rf3_predict"
+display = "Predict (RF3)"
+icon = "builtin:atom"
+tooltip = "RoseTTAFold3: re-predict the focused entity, or the whole structure when nothing is focused"
+preview = true
+
+# LigandMPNN sequence redesign of the focused chain. Selected residues are held
+# fixed; a puzzle's design mask fixes everything it does not mark designable.
+# The `sequence_design` QUERY returns scored candidates for a future panel; this
+# button is the one-shot counterpart that applies the best of them.
+[[buttons]]
+op = "mpnn_design"
+display = "LigandMPNN"
+icon = "assets/icons/protein_mpnn.png"
+tooltip = "LigandMPNN: redesign the focused chain's sequence, holding selected residues fixed"
